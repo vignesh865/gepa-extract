@@ -8,6 +8,14 @@ made explicit here rather than left to GEPA's defaults.
 which is what keeps a candidate that is uniquely good at one field alive in
 the population even when its mean score is unremarkable. It requires
 ``objective_scores`` from the adapter, which is exactly what we produce.
+
+The second is ``rounds_per_field``. GEPA's native budget, ``max_metric_calls``,
+is denominated in document extractions and says nothing about how many fields
+get a turn -- on a wide schema most of them never do. ``rounds_per_field`` is
+denominated in *rounds per field* instead, so a caller with 100 fields can ask
+for two attempts at each and get them. See ``selectors.py`` for the guarantee
+and its limits. The two are composable: keep ``max_metric_calls`` as a cost
+ceiling and let ``rounds_per_field`` decide coverage.
 """
 
 from __future__ import annotations
@@ -16,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import gepa
+from gepa.utils.stop_condition import MaxCandidateProposalsStopper
 
 from gepa_extract.adapter import ExtractionAdapter
 from gepa_extract.documents import Example
@@ -23,8 +32,9 @@ from gepa_extract.extraction import Extractor
 from gepa_extract.reflection import build_templates
 from gepa_extract.rendering import PageRenderer
 from gepa_extract.schema import ExtractionSchema
+from gepa_extract.selectors import FieldCoverageSelector, RoundsPerFieldStopper
 
-__all__ = ["OptimizationResult", "optimize_descriptions", "score_candidate"]
+__all__ = ["OptimizationResult", "estimate_metric_calls", "optimize_descriptions", "score_candidate"]
 
 
 @dataclass(slots=True)
@@ -36,10 +46,22 @@ class OptimizationResult:
     gepa_result: Any = None
     per_field_seed: dict[str, float] = field(default_factory=dict)
     per_field_best: dict[str, float] = field(default_factory=dict)
+    # How many reflection rounds each field actually received. Empty unless
+    # rounds_per_field was used -- stock round_robin does not expose this, and
+    # inferring it from gepa's trace would be guesswork.
+    rounds: dict[str, int] = field(default_factory=dict)
 
     @property
     def changed_fields(self) -> list[str]:
         return [k for k, v in self.best_descriptions.items() if v.strip() != self.seed_descriptions.get(k, "").strip()]
+
+    @property
+    def unvisited_fields(self) -> list[str]:
+        """Fields that never got a reflection round. The honest denominator for
+        'why did nothing improve here' -- untouched is not the same as tried."""
+        if not self.rounds:
+            return []
+        return [path for path in sorted(self.best_descriptions) if not self.rounds.get(path)]
 
     def report(self) -> str:
         lines = [
@@ -54,8 +76,11 @@ class OptimizationResult:
             before = self.per_field_seed.get(path, 0.0)
             after = self.per_field_best[path]
             marker = "*" if path in self.changed_fields else " "
-            lines.append(f"  {marker} {path:<28} {before:.3f} -> {after:.3f}  ({after - before:+.3f})")
+            rounds = f"  [{self.rounds[path]} rounds]" if path in self.rounds else ""
+            lines.append(f"  {marker} {path:<28} {before:.3f} -> {after:.3f}  ({after - before:+.3f}){rounds}")
         lines += ["", f"descriptions changed: {len(self.changed_fields)}/{len(self.best_descriptions)}"]
+        if self.rounds:
+            lines.append(f"fields never given a round: {len(self.unvisited_fields)}/{len(self.best_descriptions)}")
         return "\n".join(lines)
 
 
@@ -85,6 +110,30 @@ def score_candidate(
     return overall, means
 
 
+def estimate_metric_calls(
+    n_fields: int,
+    n_valset: int,
+    *,
+    rounds_per_field: int = 1,
+    reflection_minibatch_size: int = 5,
+    acceptance_rate: float = 0.3,
+) -> int:
+    """Rough document-extraction cost of a ``rounds_per_field`` run.
+
+    Coverage and cost are different currencies, and the gap between them is
+    where budgets get set wrongly: asking for 2 rounds across 100 fields is a
+    four-figure extraction bill, not 200 calls. Per round gepa evaluates the
+    parent and the child on a minibatch, and re-evaluates the whole valset only
+    when the child is accepted -- hence the acceptance term.
+
+    Deliberately an over-estimate: parent minibatch evaluations are frequently
+    cache hits, which cost nothing. Treat it as a ceiling for planning, not a
+    forecast.
+    """
+    per_round = 2 * reflection_minibatch_size + acceptance_rate * n_valset
+    return int(n_valset + rounds_per_field * n_fields * per_round)
+
+
 def optimize_descriptions(
     schema: ExtractionSchema,
     extractor: Extractor,
@@ -93,11 +142,17 @@ def optimize_descriptions(
     reflection_lm: Any,
     valset: list[Example] | None = None,
     renderer: PageRenderer | None = None,
-    max_metric_calls: int = 150,
+    max_metric_calls: int | None = 150,
+    rounds_per_field: int | None = None,
+    max_iterations: int | None = None,
     reflection_minibatch_size: int = 5,
     max_pages: int | None = None,
     max_image_documents: int = 3,
     max_workers: int = 8,
+    module_selector: Any = None,
+    frontier_type: str = "objective",
+    candidate_selection_strategy: str = "pareto",
+    cache_evaluation: bool = True,
     run_dir: str | None = None,
     seed: int = 0,
     display_progress_bar: bool = False,
@@ -114,8 +169,32 @@ def optimize_descriptions(
             this package. Enable it only where tqdm is installed.
         max_metric_calls: Budget, counted in *document extractions*. Every call
             is a real vision request against a real document, so this is the
-            knob that decides what a run costs.
+            knob that decides what a run costs. Pass None to let
+            ``rounds_per_field`` alone decide when the run ends -- coverage is
+            then guaranteed but cost is not bounded.
+        rounds_per_field: Guarantee each field that still needs work this many
+            reflection rounds before stopping. This is the knob to reach for on
+            a wide schema: ``max_metric_calls`` cannot express "every field gets
+            a turn", because it is denominated in documents, not fields. Fields
+            that reach a perfect score retire and hand their turns to fields
+            still failing, so the cost is set by how many fields are actually
+            broken rather than by how many exist.
+        max_iterations: Backstop when ``rounds_per_field`` is set. Defaults to
+            twice the nominal requirement, which absorbs the iterations gepa
+            spends without reaching the selector. Reaching it means the coverage
+            guarantee was *not* met; inspect
+            ``OptimizationResult.unvisited_fields``.
+        module_selector: Overrides field selection entirely. Keeps gepa's
+            parameter name because it is a straight passthrough -- gepa's own
+            class is ``ReflectionComponentSelector``, and a component is what
+            this package calls a field. Leave as None for coverage-guaranteed
+            selection (with ``rounds_per_field``) or gepa's ``"round_robin"``
+            (without).
     """
+    if rounds_per_field is not None and rounds_per_field < 1:
+        raise ValueError("rounds_per_field must be at least 1.")
+    if max_metric_calls is None and rounds_per_field is None:
+        raise ValueError("Provide at least one of max_metric_calls or rounds_per_field as a stopping condition.")
     adapter = ExtractionAdapter(
         schema,
         extractor,
@@ -126,6 +205,24 @@ def optimize_descriptions(
     )
     seed_candidate = schema.seed_candidate()
 
+    selector = module_selector
+    stop_callbacks: list[Any] = []
+    coverage: FieldCoverageSelector | None = None
+
+    if rounds_per_field is not None:
+        if selector is None:
+            coverage = FieldCoverageSelector()
+            selector = coverage
+            stop_callbacks.append(RoundsPerFieldStopper(coverage, rounds_per_field))
+        # A caller-supplied selector owns its own policy; we cannot promise
+        # coverage on its behalf, so rounds_per_field degrades to an iteration
+        # cap rather than silently claiming a guarantee it is not enforcing.
+        if max_iterations is None:
+            max_iterations = 2 * rounds_per_field * len(schema.fields)
+        stop_callbacks.append(MaxCandidateProposalsStopper(max_iterations))
+    elif max_iterations is not None:
+        stop_callbacks.append(MaxCandidateProposalsStopper(max_iterations))
+
     result = gepa.optimize(
         seed_candidate=seed_candidate,
         trainset=trainset,
@@ -134,16 +231,17 @@ def optimize_descriptions(
         reflection_lm=reflection_lm,
         reflection_prompt_template=build_templates(schema),
         # Fields are objectives: keep the front over fields, not over documents.
-        frontier_type="objective",
-        candidate_selection_strategy="pareto",
-        # Round-robin gives every field a turn. With many fields and a small
-        # budget, most of the budget goes to evaluation rather than proposal.
-        module_selector="round_robin",
+        frontier_type=frontier_type,
+        candidate_selection_strategy=candidate_selection_strategy,
+        # Without rounds_per_field this is gepa's round_robin, whose cursor is
+        # per-candidate and so covers fields unevenly once the front grows.
+        module_selector=selector if selector is not None else "round_robin",
         reflection_minibatch_size=reflection_minibatch_size,
         max_metric_calls=max_metric_calls,
+        stop_callbacks=stop_callbacks or None,
         # Repeated (candidate, document) pairs are common once the front has a
         # few members; caching keeps them from being re-extracted.
-        cache_evaluation=True,
+        cache_evaluation=cache_evaluation,
         run_dir=run_dir,
         seed=seed,
         display_progress_bar=display_progress_bar,
@@ -163,4 +261,5 @@ def optimize_descriptions(
         gepa_result=result,
         per_field_seed=seed_fields,
         per_field_best=best_fields,
+        rounds={path: coverage.rounds[path] for path in schema.field_paths} if coverage else {},
     )
