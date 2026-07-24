@@ -33,6 +33,10 @@ result = optimize_descriptions(
 
 print(result.report())
 print(result.best_descriptions["total"])
+
+# The shippable artifact: evolved descriptions dropped back into the frozen
+# skeleton. This is what you hand an extractor.
+optimised_schema = result.assembled_schema(schema)
 ```
 
 ## Why GEPA fits

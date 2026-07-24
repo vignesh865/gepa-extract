@@ -55,6 +55,21 @@ class OptimizationResult:
     def changed_fields(self) -> list[str]:
         return [k for k, v in self.best_descriptions.items() if v.strip() != self.seed_descriptions.get(k, "").strip()]
 
+    def assembled_schema(self, schema: ExtractionSchema) -> dict[str, Any]:
+        """The optimised JSON Schema, ready to hand to an extractor.
+
+        ``best_descriptions`` is a flat ``{field_path: description}`` mapping --
+        the optimiser's candidate, not something a model can be called with.
+        This is the shippable form.
+
+        The schema is a parameter rather than state on this object. The result
+        is what gets pickled and written to ``run_dir``, and it has no need to
+        carry the skeleton around to do it. Keeping the two separate is also the
+        same split the optimiser itself runs on: descriptions travel, structure
+        does not.
+        """
+        return schema.bind(self.best_descriptions)
+
     @property
     def unvisited_fields(self) -> list[str]:
         """Fields that never got a reflection round. The honest denominator for

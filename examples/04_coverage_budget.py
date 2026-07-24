@@ -144,10 +144,10 @@ def main() -> None:
     print("\n" + "=" * 72)
     print("FINAL SCHEMA (assembled)")
     print("=" * 72)
-    # bind() drops the evolved descriptions into the frozen skeleton. Keys,
-    # types, nesting and required-ness come from the skeleton the optimiser
-    # never saw, which is why the fingerprint below cannot have moved.
-    assembled = schema.bind(result_b.best_descriptions)
+    # Drops the evolved descriptions into the frozen skeleton. Keys, types,
+    # nesting and required-ness come from the skeleton the optimiser never saw,
+    # which is why the fingerprint below cannot have moved.
+    assembled = result_b.assembled_schema(schema)
     print(json.dumps(assembled, indent=2))
     print(
         "\nstructure identical to the input schema:",

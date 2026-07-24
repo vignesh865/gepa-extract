@@ -76,6 +76,30 @@ def test_report_is_readable(schema, examples) -> None:
     assert "total" in report
 
 
+def test_the_assembled_schema_carries_the_evolved_descriptions(schema, examples) -> None:
+    """The shippable artifact: descriptions dropped back into the skeleton, with
+    structure provably untouched. This is what an extractor is called with --
+    best_descriptions on its own is the optimiser's candidate, not a schema."""
+    result = optimize_descriptions(
+        schema,
+        build_extractor(examples),
+        trainset=examples,
+        reflection_lm=FakeReflectionLM(IMPROVED_TOTAL),
+        max_metric_calls=120,
+        reflection_minibatch_size=3,
+        display_progress_bar=False,
+        seed=0,
+    )
+
+    assembled = result.assembled_schema(schema)
+    assert assembled["properties"]["total"]["description"] == result.best_descriptions["total"]
+    assert "beneath the tax line" in assembled["properties"]["total"]["description"]
+    # Every leaf carries a description, including the fields never proposed for:
+    # a partial candidate must not leave holes in the schema handed to a model.
+    assert assembled["properties"]["subtotal"]["description"] == result.best_descriptions["subtotal"]
+    assert schema.structural_fingerprint_of(assembled) == schema.fingerprint()
+
+
 def test_the_reflection_model_is_shown_the_sibling_diagnosis(schema, examples) -> None:
     """The point of per-field feedback: the prompt must say which field's value
     was taken, not merely that the answer was wrong."""
