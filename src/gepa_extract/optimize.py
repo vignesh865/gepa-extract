@@ -126,27 +126,43 @@ def score_candidate(
 
 
 def estimate_metric_calls(
-    n_fields: int,
+    n_unsolved_fields: int,
     n_valset: int,
     *,
     rounds_per_field: int = 1,
     reflection_minibatch_size: int = 5,
     acceptance_rate: float = 0.3,
 ) -> int:
-    """Rough document-extraction cost of a ``rounds_per_field`` run.
+    """Document-extraction cost of a ``rounds_per_field`` run::
 
-    Coverage and cost are different currencies, and the gap between them is
-    where budgets get set wrongly: asking for 2 rounds across 100 fields is a
-    four-figure extraction bill, not 200 calls. Per round gepa evaluates the
-    parent and the child on a minibatch, and re-evaluates the whole valset only
-    when the child is accepted -- hence the acceptance term.
+        3*V  +  rounds * unsolved * (2*M + p*V)
 
-    Deliberately an over-estimate: parent minibatch evaluations are frequently
-    cache hits, which cost nothing. Treat it as a ceiling for planning, not a
-    forecast.
+    where V is the valset size, M the reflection minibatch size, and p the
+    fraction of proposals accepted. The terms:
+
+    * ``3*V`` -- gepa's seed evaluation, plus the two passes
+      ``optimize_descriptions`` makes after the run to report seed and best
+      scores. Those two are outside gepa's budget entirely and are easy to
+      forget; on a short run they dominate everything else.
+    * ``2*M`` per round -- gepa evaluates the parent and then the child on the
+      round's minibatch.
+    * ``p*V`` per round -- an accepted child is re-evaluated on the whole
+      valset. This is the only estimated term; the rest is exact.
+
+    Verified against 18 real runs (1-6 unsolved fields x 1-3 rounds x minibatch
+    2/4): with ``acceptance_rate=0`` the formula reproduces actual extraction
+    counts exactly, so error is confined to how well ``acceptance_rate``
+    matches a given corpus. Real runs accept more early and less later, so
+    treat the default as a planning ceiling rather than a forecast.
+
+    ``n_unsolved_fields`` is the count of fields that still score below 1.0 --
+    **not** the schema's field count. Solved fields retire without consuming
+    rounds, so a 100-field schema with 12 bad fields costs what 12 costs. Get
+    the number from ``score_candidate`` on the seed candidate before deciding a
+    budget.
     """
     per_round = 2 * reflection_minibatch_size + acceptance_rate * n_valset
-    return int(n_valset + rounds_per_field * n_fields * per_round)
+    return int(3 * n_valset + rounds_per_field * n_unsolved_fields * per_round)
 
 
 def optimize_descriptions(

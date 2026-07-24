@@ -99,12 +99,107 @@ perfect; an iteration-counted budget would quietly weaken exactly as fields
 start passing. `max_iterations` remains as a backstop, and hitting it means the
 guarantee was *not* met — which is what `unvisited_fields` is for.
 
-Coverage still has to be paid for in extractions. `estimate_metric_calls`
-converts between the two currencies before you spend anything:
+## Choosing `rounds_per_field`
+
+### What a run costs
+
+```
+3V  +  rounds × unsolved × (2M + p·V)
+```
+
+`V` = valset size, `M` = `reflection_minibatch_size`, `p` = fraction of
+proposals accepted, `unsolved` = fields scoring below 1.0 on the seed.
+
+| Term | Why |
+| --- | --- |
+| `3V` | GEPA's seed evaluation, **plus the two passes `optimize_descriptions` makes after the run** to report seed and best scores. Those two sit outside GEPA's budget and are easy to forget — on a short run they dominate everything else. |
+| `2M` per round | GEPA evaluates the parent, then the child, on that round's minibatch. |
+| `p·V` per round | An accepted child is re-evaluated on the whole valset. |
+
+Only `p` is an estimate; the rest is exact. Verified against 18 real runs (1–6
+unsolved fields × 1–3 rounds × minibatch 2 and 4): with `acceptance_rate=0` the
+formula reproduces actual extraction counts **exactly** — 40/40, 84/84, 108/108,
+180/180. `tests/test_selectors.py` pins those spot checks, so if the arithmetic
+drifts the documented budgets fail loudly.
+
+### The number that drives cost is `unsolved`, not your field count
+
+Solved fields retire without consuming rounds, so a 100-field schema with 12 bad
+fields costs what 12 costs — not what 100 costs. Measure it before budgeting:
 
 ```python
-estimate_metric_calls(n_fields=100, n_valset=10, rounds_per_field=2)  # ~2600
+_, per_field = score_candidate(schema, extractor, valset, schema.seed_candidate())
+unsolved = [f for f, s in per_field.items() if s < 1.0]
+
+estimate_metric_calls(len(unsolved), len(valset), rounds_per_field=2)
 ```
+
+That first call costs one pass over the valset and is the best-spent budget in
+the whole run: it tells you both what to pay for and what the optimiser is
+actually being asked to fix.
+
+### Extractions, at `V=20`, `M=5`, `p=0.3`
+
+| unsolved fields | 1 round | 2 rounds | 3 rounds |
+| ---: | ---: | ---: | ---: |
+| 5 | 140 | 220 | 300 |
+| 10 | 220 | 380 | 540 |
+| 25 | 460 | 860 | 1,260 |
+| 50 | 860 | 1,660 | 2,460 |
+| 100 | 1,660 | 3,260 | 4,860 |
+| 250 | 4,060 | 8,060 | 12,060 |
+| 500 | 8,060 | 16,060 | 24,060 |
+
+### How to set it
+
+**Start at `rounds_per_field=2`.** One round gives every field a single attempt
+with no recovery from a bad proposal; two lets a field that regressed or was
+misdiagnosed be revisited. Past three, returns fall off sharply — a description
+that has not improved in three attempts usually has a problem reflection cannot
+see, most often a gold value that is itself wrong.
+
+**Then use the cheaper levers before cutting rounds.** Both scale the whole
+run, and neither touches the coverage guarantee:
+
+| Lever | Effect on 100 unsolved fields, 2 rounds |
+| --- | --- |
+| `V=20`, `M=5` (defaults) | 3,260 |
+| `M=3` | 2,460 |
+| `V=10`, `M=3` | 1,830 |
+| `V=5`, `M=3` | 1,515 |
+
+A small valset is the strongest lever, and the one to be careful with: it is
+also your only estimate of whether a description generalises. Below ~8
+documents a single unusual invoice starts steering the whole run. Prefer
+cutting `M` first.
+
+**Worked example — 120-field schema, Gemini Flash.** Seed scoring finds 18
+fields below 1.0. At `V=15`, `M=3`, `rounds_per_field=2`:
+
+```
+3(15) + 2 × 18 × (2·3 + 0.3·15) = 45 + 36 × 10.5 = 423 extractions
+```
+
+Roughly 423 documents through Flash and ~36 reflection calls through Pro —
+against 120 fields that would have been unaffordable to cover naively. Budget
+the same run by metric calls instead and you would have to guess, and would
+almost certainly leave most of the 18 untouched.
+
+Keep `max_metric_calls` set as well. It costs nothing when the estimate holds
+and caps the damage when `p` turns out much higher than assumed:
+
+```python
+optimize_descriptions(
+    schema, extractor, trainset,
+    reflection_lm=...,
+    rounds_per_field=2,
+    max_metric_calls=800,   # ceiling, ~2x the estimate
+)
+```
+
+Then check `result.unvisited_fields` — if it contains fields scoring below 1.0,
+the ceiling stopped the run before coverage completed and the guarantee did not
+hold.
 
 ## Only descriptions evolve
 

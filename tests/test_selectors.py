@@ -255,3 +255,33 @@ class TestCostEstimate:
         wide = estimate_metric_calls(100, 10, rounds_per_field=2)
         narrow = estimate_metric_calls(15, 10, rounds_per_field=2)
         assert narrow < wide / 5
+
+    def test_it_counts_the_post_run_scoring_passes(self) -> None:
+        """optimize_descriptions scores seed and best after the run, outside
+        gepa's budget. Omitting them understated a short run by more than half:
+        the 1-field/1-round/minibatch-2 case below is 40 extractions, 24 of
+        which are these passes."""
+        assert estimate_metric_calls(0, 12, rounds_per_field=1) == 36
+
+    def test_the_formula_matches_measured_runs_when_nothing_is_accepted(self) -> None:
+        """Calibration, pinned. Against 18 real runs over the 12-document
+        corpus, with a reflection LM that never improves anything (so nothing is
+        accepted and the p*V term is genuinely zero), the estimate equalled the
+        actual extraction count exactly. These four are spot checks from that
+        sweep; if the arithmetic drifts, the documented budgets are wrong."""
+        measured = [
+            # (unsolved, rounds, minibatch, actual extractions)
+            (1, 1, 2, 40),
+            (3, 2, 4, 84),
+            (6, 2, 2, 84),
+            (6, 3, 4, 180),
+        ]
+        for unsolved, rounds, minibatch, actual in measured:
+            predicted = estimate_metric_calls(
+                unsolved,
+                12,
+                rounds_per_field=rounds,
+                reflection_minibatch_size=minibatch,
+                acceptance_rate=0.0,
+            )
+            assert predicted == actual, f"{unsolved} fields, {rounds} rounds, mb={minibatch}"
