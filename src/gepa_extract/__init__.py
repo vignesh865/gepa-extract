@@ -14,13 +14,22 @@ from gepa_extract.adapter import ExtractionAdapter
 from gepa_extract.documents import Document, Example, load_examples, split
 from gepa_extract.errors import ErrorClass
 from gepa_extract.extraction import CallableExtractor, ExtractionResult, Extractor, StubExtractor
-from gepa_extract.optimize import OptimizationResult, optimize_descriptions, score_candidate
+from gepa_extract.optimize import (
+    BudgetPlan,
+    OptimizationResult,
+    estimate_metric_calls,
+    optimize_descriptions,
+    plan_budget,
+    score_candidate,
+)
 from gepa_extract.reflection import build_templates
 from gepa_extract.rendering import NullRenderer, PageRenderer, PdfiumRenderer, RenderedPage, StubRenderer
 from gepa_extract.schema import ExtractionSchema, FieldSpec
 from gepa_extract.scoring import DocumentOutcome, FieldOutcome, score_document
+from gepa_extract.selectors import FieldCoverageSelector, RoundsPerFieldStopper
 
 __all__ = [
+    "BudgetPlan",
     "CallableExtractor",
     "Document",
     "DocumentOutcome",
@@ -30,6 +39,7 @@ __all__ = [
     "ExtractionResult",
     "ExtractionSchema",
     "Extractor",
+    "FieldCoverageSelector",
     "FieldOutcome",
     "FieldSpec",
     "NullRenderer",
@@ -37,11 +47,14 @@ __all__ = [
     "PageRenderer",
     "PdfiumRenderer",
     "RenderedPage",
+    "RoundsPerFieldStopper",
     "StubExtractor",
     "StubRenderer",
     "build_templates",
+    "estimate_metric_calls",
     "load_examples",
     "optimize_descriptions",
+    "plan_budget",
     "score_candidate",
     "score_document",
     "split",

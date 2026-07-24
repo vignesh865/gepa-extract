@@ -1,3 +1,4 @@
+
 # gepa-extract
 
 Document extraction runs on a JSON schema in which each field's `description`
@@ -32,6 +33,10 @@ result = optimize_descriptions(
 
 print(result.report())
 print(result.best_descriptions["total"])
+
+# The shippable artifact: evolved descriptions dropped back into the frozen
+# skeleton. This is what you hand an extractor.
+optimised_schema = result.assembled_schema(schema)
 ```
 
 ## Why GEPA fits
@@ -42,6 +47,208 @@ sharper than a single global score. GEPA consumes exactly that: each field is
 a component with its own reflective dataset, and per-field scores become
 objectives on a Pareto front, so a candidate that is uniquely good at one field
 survives even when its mean is unremarkable.
+
+## Budgets: cost and coverage are different questions
+
+`max_metric_calls` is denominated in *document extractions*. It answers "what
+does this run cost", and says nothing about how many fields ever get a turn —
+on a wide schema, most of them don't. With 100 fields, a 20-document valset and
+a 300-call budget, roughly a dozen fields are reached and the other ~90 keep
+their seed descriptions. Nothing reports this.
+
+`rounds_per_field` answers the other question directly:
+
+```python
+result = optimize_descriptions(
+    schema, extractor, trainset,
+    reflection_lm=...,
+    rounds_per_field=2,     # every field that still fails gets 2 attempts
+    max_metric_calls=None,  # or keep it as a cost ceiling
+)
+print(result.unvisited_fields)   # fields that never got a round
+```
+
+A *round* is one selection of a field for reflection. `FieldCoverageSelector`
+keeps a single global round count and always serves the least-served field that
+has not yet scored 1.0, so fields that get fixed retire and hand their turns to
+fields still failing — the cost tracks how many fields are actually broken, not
+how many exist.
+
+This replaces stock `round_robin`, which is blind on two counts. It cycles
+through every field in order whether or not that field needs help, and its
+cursor is stored **per parent candidate** — so as the Pareto front grows the
+population walks several independent cursors and coverage fragments, some
+fields being proposed for repeatedly on one lineage while others are never
+reached on any.
+
+`examples/04_coverage_budget.py` measures the gap on the ten-field invoice
+schema, where only three fields are actually broken:
+
+```
+A. max_metric_calls=400, stock round_robin   0.800 -> 1.000
+     extractions 424    reflection turns 7  (4 spent on fields already at 1.000)
+B. rounds_per_field=2                        0.800 -> 1.000
+     extractions  84    reflection turns 3  (0 spent on fields already at 1.000)
+```
+
+The guarantee is deliberately narrow — every unsolved field is *selected* at
+least N times. Not that the proposals are good, and not that they are accepted.
+It is also denominated in rounds rather than iterations, because gepa abandons
+an iteration before consulting the selector when every sampled score is already
+perfect; an iteration-counted budget would quietly weaken exactly as fields
+start passing. `max_iterations` remains as a backstop, and hitting it means the
+guarantee was *not* met — which is what `unvisited_fields` is for.
+
+## Choosing `rounds_per_field`
+
+### Ask the planner
+
+`plan_budget` turns "I have this many fields and this many documents" into
+settings, with the reasoning attached:
+
+```python
+from gepa_extract import plan_budget, score_candidate
+
+# The one input worth measuring rather than guessing: cost scales with the
+# fields that are actually broken, not with how many the schema has.
+_, per_field = score_candidate(schema, extractor, docs, schema.seed_candidate())
+unsolved = sum(1 for s in per_field.values() if s < 1.0)
+
+print(plan_budget(n_fields=120, n_documents=40, n_unsolved_fields=unsolved).explain())
+```
+
+```
+rounds_per_field           2
+reflection_minibatch_size  5
+max_metric_calls           1201
+valset / holdout           32 / 8
+
+estimated cost             ~801 document extractions
+                           ~36 reflection calls
+```
+
+Pass `max_extractions` if you have a ceiling and it will solve for rounds
+rather than assuming them, or tell you plainly that nothing fits:
+
+```
+No affordable plan: the ceiling does not cover even one round.
+
+cheapest possible run       ~2448 document extractions
+                            (1 round over 120 fields, valset 32, minibatch 5)
+
+- Assuming all 120 fields need work, which is a ceiling. Score the seed
+  candidate first and pass n_unsolved_fields -- it is usually far smaller,
+  and cost scales with it.
+- Even one round costs ~2448, above the 500 ceiling. [...]
+```
+
+That is the same schema and the same 500-call ceiling as the run above: measuring
+`unsolved` first is what turns "nothing fits" into an affordable one-round plan.
+
+The advice is a defensible starting point, not a tuned value. The rest of this
+section is what it is reasoning from, if you would rather set the numbers
+yourself.
+
+### What a run costs
+
+```
+3V  +  rounds × unsolved × (2M + p·V)
+```
+
+`V` = valset size, `M` = `reflection_minibatch_size`, `p` = fraction of
+proposals accepted, `unsolved` = fields scoring below 1.0 on the seed.
+
+| Term | Why |
+| --- | --- |
+| `3V` | GEPA's seed evaluation, **plus the two passes `optimize_descriptions` makes after the run** to report seed and best scores. Those two sit outside GEPA's budget and are easy to forget — on a short run they dominate everything else. |
+| `2M` per round | GEPA evaluates the parent, then the child, on that round's minibatch. |
+| `p·V` per round | An accepted child is re-evaluated on the whole valset. |
+
+Only `p` is an estimate; the rest is exact. Checked against 18 real runs (1–6
+unsolved fields × 1–3 rounds × minibatch 2 and 4) driven by a reflection model
+that never improves anything — so nothing is accepted, `p` is genuinely zero,
+and what remains is arithmetic. All 18 matched to the extraction.
+`tests/test_selectors.py` pins four of them, so if a gepa upgrade changes when
+it evaluates, these budgets fail loudly instead of going quietly stale.
+
+### The number that drives cost is `unsolved`, not your field count
+
+Solved fields retire without consuming rounds, so a 100-field schema with 12 bad
+fields costs what 12 costs — not what 100 costs. Measure it before budgeting:
+
+```python
+_, per_field = score_candidate(schema, extractor, valset, schema.seed_candidate())
+unsolved = [f for f, s in per_field.items() if s < 1.0]
+
+estimate_metric_calls(len(unsolved), len(valset), rounds_per_field=2)
+```
+
+That first call costs one pass over the valset and is the best-spent budget in
+the whole run: it tells you both what to pay for and what the optimiser is
+actually being asked to fix.
+
+### Extractions, at `V=20`, `M=5`, `p=0.3`
+
+| unsolved fields | 1 round | 2 rounds | 3 rounds |
+| ---: | ---: | ---: | ---: |
+| 5 | 140 | 220 | 300 |
+| 10 | 220 | 380 | 540 |
+| 25 | 460 | 860 | 1,260 |
+| 50 | 860 | 1,660 | 2,460 |
+| 100 | 1,660 | 3,260 | 4,860 |
+| 250 | 4,060 | 8,060 | 12,060 |
+| 500 | 8,060 | 16,060 | 24,060 |
+
+### How to set it
+
+**Start at `rounds_per_field=2`.** One round gives every field a single attempt
+with no recovery from a bad proposal; two lets a field that regressed or was
+misdiagnosed be revisited. Past three, returns fall off sharply — a description
+that has not improved in three attempts usually has a problem reflection cannot
+see, most often a gold value that is itself wrong.
+
+**Then use the cheaper levers before cutting rounds.** Both scale the whole
+run, and neither touches the coverage guarantee:
+
+| Lever | Effect on 100 unsolved fields, 2 rounds |
+| --- | --- |
+| `V=20`, `M=5` (defaults) | 3,260 |
+| `M=3` | 2,460 |
+| `V=10`, `M=3` | 1,830 |
+| `V=5`, `M=3` | 1,515 |
+
+A small valset is the strongest lever, and the one to be careful with: it is
+also your only estimate of whether a description generalises. Below ~8
+documents a single unusual invoice starts steering the whole run. Prefer
+cutting `M` first.
+
+**Worked example — 120-field schema, Gemini Flash.** Seed scoring finds 18
+fields below 1.0. At `V=15`, `M=3`, `rounds_per_field=2`:
+
+```
+3(15) + 2 × 18 × (2·3 + 0.3·15) = 45 + 36 × 10.5 = 423 extractions
+```
+
+Roughly 423 documents through Flash and ~36 reflection calls through Pro —
+against 120 fields that would have been unaffordable to cover naively. Budget
+the same run by metric calls instead and you would have to guess, and would
+almost certainly leave most of the 18 untouched.
+
+Keep `max_metric_calls` set as well. It costs nothing when the estimate holds
+and caps the damage when `p` turns out much higher than assumed:
+
+```python
+optimize_descriptions(
+    schema, extractor, trainset,
+    reflection_lm=...,
+    rounds_per_field=2,
+    max_metric_calls=800,   # ceiling, ~2x the estimate
+)
+```
+
+Then check `result.unvisited_fields` — if it contains fields scoring below 1.0,
+the ceiling stopped the run before coverage completed and the guarantee did not
+hold.
 
 ## Only descriptions evolve
 
@@ -121,6 +328,7 @@ The core installs with neither, and the whole test suite runs offline against
 | `examples/01_offline_invoices.py` | no | The full loop end to end, including a `total`→subtotal failure being diagnosed and fixed |
 | `examples/02_gemini_invoices.py` | yes | Real Gemini extraction over real PDFs, vision reflection, holdout scoring |
 | `examples/03_custom_backend.py` | no | Adding a provider by implementing `Extractor` |
+| `examples/04_coverage_budget.py` | no | The same run under a metric-call budget vs `rounds_per_field` — identical score, 424 extractions vs 84 |
 | `examples/generate_invoices.py` | no | Builds the PDF corpus used above, in three vendor layouts |
 
 Run them as modules, so the shared schema import resolves:
@@ -130,7 +338,7 @@ python -m examples.generate_invoices    # writes 12 real PDFs + gold manifest
 python -m examples.01_offline_invoices  # ~1s, no API key
 ```
 
-The offline example takes the seed descriptions from 0.783 to 1.000 and changes
+The offline example takes the seed descriptions from 0.800 to 1.000 and changes
 exactly three of ten descriptions — the three it was given evidence about.
 
 ## Adding a backend
@@ -155,6 +363,7 @@ schema.py      frozen skeleton + candidate binding   <- the safety property
 scoring.py     per-field scoring + sibling detection <- the signal
 errors.py      error classes + reflection guidance
 reflection.py  asymmetry-aware prompt templates
+selectors.py   coverage guarantee over fields          <- rounds, not calls
 rendering.py   PDF -> PNG for the reflection model
 extraction.py  the backend interface
 adapter.py     the GEPA seam  ) the only two modules

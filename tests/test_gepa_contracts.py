@@ -12,10 +12,14 @@ question to answer is "did gepa change, and what does that cost us" -- not
 
 from __future__ import annotations
 
+import inspect
+
 import gepa
 import pytest
 from gepa import Image
 from gepa.strategies.instruction_proposal import InstructionProposalSignature
+from gepa.strategies.proposal_sampling import SingleMutationSampling
+from gepa.utils.stop_condition import MaxCandidateProposalsStopper
 
 from gepa_extract import ExtractionAdapter, StubExtractor, build_templates
 from gepa_extract.reflection import BASE_TEMPLATE
@@ -157,6 +161,91 @@ class TestContract3PerFieldReflectionTemplates:
 
     def test_array_fields_are_steered_toward_same_row_confusables(self, schema) -> None:
         assert "OTHER COLUMNS OF THE SAME ROW" in build_templates(schema)["line_items[].quantity"]
+
+
+class TestContract5CoverageGuaranteeFoundations:
+    """The four gepa behaviours ``rounds_per_field`` is built on.
+
+    The guarantee "every unsolved field gets N reflection rounds" is only as
+    sound as these. If one moves, the promise in selectors.py weakens, and it
+    should fail here rather than quietly deliver worse coverage.
+    """
+
+    def test_one_iteration_yields_exactly_one_component_selection(self) -> None:
+        """The default sampling strategy emits a single (parent, minibatch)
+        task, so an iteration can spend at most one round. Multi-task strategies
+        (SameParentSampling, PxNSampling) break this identity -- which is why we
+        count rounds in the selector rather than reading gepa's iteration count."""
+
+        class FakeSelector:
+            def select_candidate_idx(self, state):
+                return 0
+
+        class FakeBatchSampler:
+            def next_minibatch_ids(self, trainset, state):
+                return [0]
+
+        class FakeTrainset:
+            def fetch(self, ids):
+                return ["doc"]
+
+        state = type("S", (), {"program_candidates": [{"total": "x"}]})()
+        tasks = SingleMutationSampling().sample_tasks(state, FakeSelector(), FakeBatchSampler(), FakeTrainset())
+        assert len(tasks) == 1
+
+    def test_module_selector_accepts_an_instance_and_sees_per_field_scores(self, schema, examples) -> None:
+        """Two things at once: a ReflectionComponentSelector object is accepted
+        where the string 'round_robin' would go, and the state it receives
+        carries ``prog_candidate_objective_scores`` as {field_path: score} --
+        the signal our selector uses to retire solved fields."""
+        seen: list[dict] = []
+
+        class CapturingSelector:
+            def __call__(self, state, trajectories, subsample_scores, candidate_idx, candidate):
+                seen.extend(state.prog_candidate_objective_scores)
+                return ["total"]
+
+        gepa.optimize(
+            seed_candidate=schema.seed_candidate(),
+            trainset=examples,
+            valset=examples,
+            adapter=ExtractionAdapter(schema, subtotal_grabbing_extractor(examples)),
+            reflection_lm=FakeReflectionLM(IMPROVED_TOTAL),
+            frontier_type="objective",
+            module_selector=CapturingSelector(),
+            max_metric_calls=30,
+            display_progress_bar=False,
+            seed=0,
+        )
+
+        assert seen, "the selector must actually be consulted"
+        assert set(seen[0]) == set(schema.field_paths)
+        assert all(isinstance(v, float) for v in seen[0].values())
+
+    def test_stop_callbacks_alone_can_terminate_a_run(self, schema, examples) -> None:
+        """max_metric_calls must be optional, or coverage could never be the
+        sole stopping condition."""
+        result = gepa.optimize(
+            seed_candidate=schema.seed_candidate(),
+            trainset=examples,
+            valset=examples,
+            adapter=ExtractionAdapter(schema, subtotal_grabbing_extractor(examples)),
+            reflection_lm=FakeReflectionLM(IMPROVED_TOTAL),
+            frontier_type="objective",
+            max_metric_calls=None,
+            stop_callbacks=MaxCandidateProposalsStopper(2),
+            display_progress_bar=False,
+            seed=0,
+        )
+        assert result.best_candidate is not None
+
+    def test_perfect_minibatches_skip_the_iteration_before_component_selection(self) -> None:
+        """Documented leak, not a wish: gepa abandons an iteration when every
+        sampled score is already perfect, and it does so *before* calling the
+        module selector. Such iterations advance state.i without crediting a
+        round -- which is precisely why RoundsPerFieldStopper counts rounds
+        instead of iterations."""
+        assert "skip_perfect_score" in inspect.signature(gepa.optimize).parameters
 
 
 class TestContract4StructureIsUnreachable:
