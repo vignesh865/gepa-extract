@@ -20,7 +20,7 @@ from gepa_extract import (
     StubExtractor,
     optimize_descriptions,
 )
-from gepa_extract.optimize import estimate_metric_calls
+from gepa_extract.optimize import estimate_metric_calls, plan_budget
 from tests.conftest import make_gold
 from tests.test_gepa_contracts import IMPROVED_TOTAL, FakeReflectionLM, subtotal_grabbing_extractor
 
@@ -262,6 +262,55 @@ class TestCostEstimate:
         the 1-field/1-round/minibatch-2 case below is 40 extractions, 24 of
         which are these passes."""
         assert estimate_metric_calls(0, 12, rounds_per_field=1) == 36
+
+    def test_planning_advice_scales_with_the_broken_fields_not_the_schema(self) -> None:
+        """The point of measuring first: the same schema and corpus, planned
+        with and without knowing how many fields are actually broken."""
+        blind = plan_budget(120, 40)
+        measured = plan_budget(120, 40, n_unsolved_fields=18)
+        assert measured.estimated_calls < blind.estimated_calls / 5
+        assert any("ceiling" in note for note in blind.notes), "an assumed field count must be flagged"
+        assert measured.notes == [], "a measured plan within budget needs no caveats"
+
+    def test_a_ceiling_trades_rounds_down_before_giving_up(self) -> None:
+        assert plan_budget(120, 40, n_unsolved_fields=18, max_extractions=500).rounds_per_field == 1
+        assert plan_budget(120, 40, n_unsolved_fields=18, max_extractions=900).rounds_per_field == 2
+
+    def test_a_generous_ceiling_is_a_limit_not_a_target(self) -> None:
+        """A ceiling may push rounds down, never up. Spending a large budget on
+        a third round costs ~50% more for a gain that is usually marginal."""
+        assert plan_budget(120, 40, n_unsolved_fields=18, max_extractions=100_000).rounds_per_field == 2
+        assert plan_budget(120, 40, n_unsolved_fields=18).rounds_per_field == 2
+
+    def test_an_unaffordable_ceiling_reports_rather_than_recommends(self) -> None:
+        """Silently returning rounds=1 over budget would be worse than useless:
+        the caller asked for a ceiling and would blow through it."""
+        plan = plan_budget(120, 40, max_extractions=500)
+        assert plan.fits is False
+        assert plan.rounds_per_field == 0
+        explained = plan.explain()
+        assert "No affordable plan" in explained
+        assert "max_metric_calls" not in explained, "must not read as advice to proceed"
+
+    def test_a_corpus_too_small_to_split_says_so(self) -> None:
+        plan = plan_budget(10, 6)
+        assert plan.holdout_size == 0
+        assert plan.valset_size == 6
+        assert any("overstate generalisation" in note for note in plan.notes)
+        assert plan.reflection_minibatch_size <= plan.valset_size
+
+    def test_it_refuses_inputs_it_cannot_plan_for(self) -> None:
+        with pytest.raises(ValueError, match="at least"):
+            plan_budget(0, 20)
+        with pytest.raises(ValueError, match="at least"):
+            plan_budget(10, 1)
+
+    def test_the_recommended_ceiling_leaves_headroom_over_the_estimate(self) -> None:
+        """acceptance_rate is the one guessed term; a run that accepts more than
+        assumed costs more, and the ceiling must not cut it off at exactly the
+        estimate."""
+        plan = plan_budget(120, 40, n_unsolved_fields=18)
+        assert plan.max_metric_calls > plan.estimated_calls
 
     def test_the_formula_matches_measured_runs_when_nothing_is_accepted(self) -> None:
         """Calibration, pinned. Against 18 real runs over the 12-document

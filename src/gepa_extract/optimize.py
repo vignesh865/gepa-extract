@@ -34,7 +34,14 @@ from gepa_extract.rendering import PageRenderer
 from gepa_extract.schema import ExtractionSchema
 from gepa_extract.selectors import FieldCoverageSelector, RoundsPerFieldStopper
 
-__all__ = ["OptimizationResult", "estimate_metric_calls", "optimize_descriptions", "score_candidate"]
+__all__ = [
+    "BudgetPlan",
+    "OptimizationResult",
+    "estimate_metric_calls",
+    "optimize_descriptions",
+    "plan_budget",
+    "score_candidate",
+]
 
 
 @dataclass(slots=True)
@@ -163,6 +170,149 @@ def estimate_metric_calls(
     """
     per_round = 2 * reflection_minibatch_size + acceptance_rate * n_valset
     return int(3 * n_valset + rounds_per_field * n_unsolved_fields * per_round)
+
+
+@dataclass(slots=True)
+class BudgetPlan:
+    """Suggested settings for a run, with the reasoning attached."""
+
+    rounds_per_field: int
+    valset_size: int
+    holdout_size: int
+    reflection_minibatch_size: int
+    max_metric_calls: int
+    estimated_calls: int
+    unsolved_assumed: int
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def fits(self) -> bool:
+        return self.rounds_per_field >= 1
+
+    def explain(self) -> str:
+        if not self.fits:
+            # No settings are recommended in this case, so none are shown --
+            # printing a max_metric_calls here would read as advice to proceed.
+            lines = [
+                "No affordable plan: the ceiling does not cover even one round.",
+                "",
+                f"cheapest possible run       ~{self.estimated_calls} document extractions",
+                (
+                    f"                            (1 round over {self.unsolved_assumed} fields, "
+                    f"valset {self.valset_size}, minibatch {self.reflection_minibatch_size})"
+                ),
+                "",
+            ]
+        else:
+            lines = [
+                f"rounds_per_field           {self.rounds_per_field}",
+                f"reflection_minibatch_size  {self.reflection_minibatch_size}",
+                f"max_metric_calls           {self.max_metric_calls}",
+                f"valset / holdout           {self.valset_size} / {self.holdout_size}",
+                "",
+                f"estimated cost             ~{self.estimated_calls} document extractions",
+                f"                           ~{self.rounds_per_field * self.unsolved_assumed} reflection calls",
+                "",
+            ]
+        lines += [f"- {note}" for note in self.notes]
+        return "\n".join(lines)
+
+
+def plan_budget(
+    n_fields: int,
+    n_documents: int,
+    *,
+    n_unsolved_fields: int | None = None,
+    max_extractions: int | None = None,
+    acceptance_rate: float = 0.3,
+) -> BudgetPlan:
+    """Suggest run settings for a schema of ``n_fields`` and ``n_documents`` docs.
+
+    Advisory, not authoritative: these are defensible starting points, not
+    tuned values. The one input that matters most is ``n_unsolved_fields``, and
+    it is the one you have to measure rather than guess -- cost scales with the
+    fields that are actually broken, and on a typical schema that is a small
+    fraction of the total::
+
+        _, per_field = score_candidate(schema, extractor, docs, schema.seed_candidate())
+        unsolved = sum(1 for s in per_field.values() if s < 1.0)
+        plan = plan_budget(len(schema.fields), len(docs), n_unsolved_fields=unsolved)
+
+    Left unspecified, every field is assumed broken, which is a ceiling rather
+    than a forecast -- usually a large overestimate.
+
+    Args:
+        max_extractions: A ceiling you are willing to spend. Given one, rounds
+            are solved for rather than assumed, and ``fits`` reports False when
+            not even a single round is affordable.
+    """
+    if n_fields < 1 or n_documents < 2:
+        raise ValueError("Need at least 1 field and 2 documents to plan a run.")
+
+    notes: list[str] = []
+    unsolved = n_unsolved_fields if n_unsolved_fields is not None else n_fields
+    if n_unsolved_fields is None:
+        notes.append(
+            f"Assuming all {n_fields} fields need work, which is a ceiling. Score the seed candidate "
+            f"first and pass n_unsolved_fields -- it is usually far smaller, and cost scales with it."
+        )
+
+    # Hold out roughly a fifth for honest final scoring, but only when there is
+    # enough left to optimise against. Below ~10 documents a holdout costs more
+    # in signal than it buys in confidence.
+    holdout = max(2, n_documents // 5) if n_documents >= 10 else 0
+    valset = n_documents - holdout
+    if holdout == 0:
+        notes.append(
+            f"Too few documents ({n_documents}) to hold any out; scores will be measured on the "
+            f"documents optimised against and will overstate generalisation."
+        )
+    elif valset < 8:
+        notes.append(f"A {valset}-document valset is small; one unusual layout can steer the whole run.")
+
+    # Minibatch drives 2M of the per-round cost, so it is the cheap lever. Small
+    # batches make the per-field diagnosis noisier, hence the floor.
+    minibatch = min(5, max(2, valset // 4))
+
+    def cost(rounds: int) -> int:
+        return estimate_metric_calls(
+            unsolved,
+            valset,
+            rounds_per_field=rounds,
+            reflection_minibatch_size=minibatch,
+            acceptance_rate=acceptance_rate,
+        )
+
+    # Two rounds is the recommendation: one gives a field no recovery from a
+    # single bad proposal, and past two the returns fall off sharply. A ceiling
+    # can only push this down, never up -- it is a limit on what may be spent,
+    # not an instruction to spend it, and a third round costs ~50% more for a
+    # gain that is usually marginal.
+    rounds = 2
+    if max_extractions is not None:
+        affordable = [r for r in (2, 1) if cost(r) <= max_extractions]
+        rounds = affordable[0] if affordable else 0
+        if rounds == 0:
+            notes.append(
+                f"Even one round costs ~{cost(1)}, above the {max_extractions} ceiling. Reduce the field "
+                f"count with n_unsolved_fields, shrink the valset, or raise the ceiling."
+            )
+        elif rounds == 1:
+            notes.append("Only one round is affordable: a field that gets a bad proposal cannot recover from it.")
+
+    estimated = cost(max(rounds, 1))
+    return BudgetPlan(
+        rounds_per_field=rounds,
+        valset_size=valset,
+        holdout_size=holdout,
+        reflection_minibatch_size=minibatch,
+        # Headroom over the estimate: acceptance_rate is the one term that is
+        # guessed, and a run that accepts more than assumed costs more.
+        max_metric_calls=int(estimated * 1.5),
+        estimated_calls=estimated,
+        unsolved_assumed=unsolved,
+        notes=notes,
+    )
 
 
 def optimize_descriptions(

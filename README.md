@@ -101,6 +101,54 @@ guarantee was *not* met — which is what `unvisited_fields` is for.
 
 ## Choosing `rounds_per_field`
 
+### Ask the planner
+
+`plan_budget` turns "I have this many fields and this many documents" into
+settings, with the reasoning attached:
+
+```python
+from gepa_extract import plan_budget, score_candidate
+
+# The one input worth measuring rather than guessing: cost scales with the
+# fields that are actually broken, not with how many the schema has.
+_, per_field = score_candidate(schema, extractor, docs, schema.seed_candidate())
+unsolved = sum(1 for s in per_field.values() if s < 1.0)
+
+print(plan_budget(n_fields=120, n_documents=40, n_unsolved_fields=unsolved).explain())
+```
+
+```
+rounds_per_field           2
+reflection_minibatch_size  5
+max_metric_calls           1201
+valset / holdout           32 / 8
+
+estimated cost             ~801 document extractions
+                           ~36 reflection calls
+```
+
+Pass `max_extractions` if you have a ceiling and it will solve for rounds
+rather than assuming them, or tell you plainly that nothing fits:
+
+```
+No affordable plan: the ceiling does not cover even one round.
+
+cheapest possible run       ~2448 document extractions
+                            (1 round over 120 fields, valset 32, minibatch 5)
+
+- Assuming all 120 fields need work, which is a ceiling. Score the seed
+  candidate first and pass n_unsolved_fields -- it is usually far smaller,
+  and cost scales with it.
+- Even one round costs ~2448, above the 500 ceiling. [...]
+```
+
+That is the same schema and the same 500-call ceiling as the run above: measuring
+`unsolved` first is what turns "nothing fits" into an affordable one-round plan.
+
+The advice is a defensible starting point, not a tuned value. The rest of this
+section is what it is reasoning from, if you would rather set the numbers
+yourself.
+
 ### What a run costs
 
 ```
@@ -116,13 +164,12 @@ proposals accepted, `unsolved` = fields scoring below 1.0 on the seed.
 | `2M` per round | GEPA evaluates the parent, then the child, on that round's minibatch. |
 | `p·V` per round | An accepted child is re-evaluated on the whole valset. |
 
-Only `p` is an estimate; the rest is exact. `examples/05_budget_calibration.py`
-proves it: 18 configurations (1–6 unsolved fields × 1–3 rounds × minibatch 2 and
-4), each run for real against a reflection model that never improves anything —
-so nothing is accepted, `p` is genuinely zero, and what remains is arithmetic.
-All 18 match to the extraction. Re-run it after a gepa upgrade; it exits
-non-zero if these budgets have gone stale. `tests/test_selectors.py` pins four
-of the configurations so the suite catches it too.
+Only `p` is an estimate; the rest is exact. Checked against 18 real runs (1–6
+unsolved fields × 1–3 rounds × minibatch 2 and 4) driven by a reflection model
+that never improves anything — so nothing is accepted, `p` is genuinely zero,
+and what remains is arithmetic. All 18 matched to the extraction.
+`tests/test_selectors.py` pins four of them, so if a gepa upgrade changes when
+it evaluates, these budgets fail loudly instead of going quietly stale.
 
 ### The number that drives cost is `unsolved`, not your field count
 
@@ -282,7 +329,6 @@ The core installs with neither, and the whole test suite runs offline against
 | `examples/02_gemini_invoices.py` | yes | Real Gemini extraction over real PDFs, vision reflection, holdout scoring |
 | `examples/03_custom_backend.py` | no | Adding a provider by implementing `Extractor` |
 | `examples/04_coverage_budget.py` | no | The same run under a metric-call budget vs `rounds_per_field` — identical score, 424 extractions vs 84 |
-| `examples/05_budget_calibration.py` | no | Sweeps 18 configurations and checks `estimate_metric_calls` against measured cost; exits non-zero if the README's budgets have gone stale |
 | `examples/generate_invoices.py` | no | Builds the PDF corpus used above, in three vendor layouts |
 
 Run them as modules, so the shared schema import resolves:
