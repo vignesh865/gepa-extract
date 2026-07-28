@@ -87,10 +87,7 @@ class OptimizationResult:
 
     def report(self) -> str:
         lines = [
-            (
-                f"overall   {self.seed_score:.3f} -> {self.best_score:.3f}  "
-                f"({self.best_score - self.seed_score:+.3f})"
-            ),
+            (f"overall   {self.seed_score:.3f} -> {self.best_score:.3f}  ({self.best_score - self.seed_score:+.3f})"),
             "",
             "per field:",
         ]
@@ -330,6 +327,7 @@ def optimize_descriptions(
     max_pages: int | None = None,
     max_image_documents: int = 3,
     max_workers: int = 8,
+    array_order: str = "aligned",
     module_selector: Any = None,
     frontier_type: str = "objective",
     candidate_selection_strategy: str = "pareto",
@@ -365,6 +363,12 @@ def optimize_descriptions(
             spends without reaching the selector. Reaching it means the coverage
             guarantee was *not* met; inspect
             ``OptimizationResult.unvisited_fields``.
+        array_order: How rows of a repeating table are paired with gold rows
+            when scoring. Defaults to ``"aligned"``: rows are matched by
+            content, so an extractor that reorders or drops a row is charged
+            for that row alone instead of having every subsequent row
+            misclassified. Use ``"positional"`` only when document order is
+            itself part of the contract.
         module_selector: Overrides field selection entirely. Keeps gepa's
             parameter name because it is a straight passthrough -- gepa's own
             class is ``ReflectionComponentSelector``, and a component is what
@@ -383,6 +387,7 @@ def optimize_descriptions(
         max_pages=max_pages,
         max_image_documents=max_image_documents,
         max_workers=max_workers,
+        array_order=array_order,
     )
     seed_candidate = schema.seed_candidate()
 
@@ -431,7 +436,9 @@ def optimize_descriptions(
 
     best = dict(getattr(result, "best_candidate", None) or seed_candidate)
     evaluation_set = valset or trainset
-    seed_score, seed_fields = score_candidate(schema, extractor, evaluation_set, seed_candidate, max_workers=max_workers)
+    seed_score, seed_fields = score_candidate(
+        schema, extractor, evaluation_set, seed_candidate, max_workers=max_workers
+    )
     best_score, best_fields = score_candidate(schema, extractor, evaluation_set, best, max_workers=max_workers)
 
     return OptimizationResult(

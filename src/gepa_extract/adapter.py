@@ -66,6 +66,8 @@ class ExtractionAdapter:
         max_image_documents: How many of those records carry page images. Images
             dominate reflection cost; the rest contribute text evidence only.
         max_workers: Concurrent extractions.
+        array_order: Row-matching policy for repeating tables. See
+            ``scoring.score_document``.
     """
 
     def __init__(
@@ -78,6 +80,7 @@ class ExtractionAdapter:
         max_records_per_component: int = 6,
         max_image_documents: int = 3,
         max_workers: int = 8,
+        array_order: str = "aligned",
     ) -> None:
         self.schema = schema
         self.extractor = extractor
@@ -86,6 +89,7 @@ class ExtractionAdapter:
         self.max_records_per_component = max_records_per_component
         self.max_image_documents = max_image_documents
         self.max_workers = max_workers
+        self.array_order = array_order
         # GEPA discovers this attribute by duck typing; None means "use the
         # built-in reflective proposer", which is what we want -- we steer it
         # with reflection_prompt_template instead of replacing it.
@@ -117,6 +121,7 @@ class ExtractionAdapter:
                 extracted=result.data,
                 gold=example.gold,
                 extraction_error=result.error,
+                array_order=self.array_order,
             )
             return ExtractionTrace(example=example, result=result, outcome=outcome)
 
@@ -268,9 +273,7 @@ def _pattern_summary(component: str, traces: list[ExtractionTrace]) -> str:
         f"Pattern across this batch: {count}/{total} documents failed with '{error.value}'."
         for error, count in classes.most_common()
     ]
-    lines += [
-        f"Of those, {count} returned the value belonging to '{name}'." for name, count in siblings.most_common()
-    ]
+    lines += [f"Of those, {count} returned the value belonging to '{name}'." for name, count in siblings.most_common()]
     return " ".join(lines)
 
 

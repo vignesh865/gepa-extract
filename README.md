@@ -297,6 +297,29 @@ Scoring classifies *how* each field failed, because the fixes diverge:
 *exactly some other field's gold value*, that is detectable from the data alone,
 and it is the difference between "wrong" and "took the subtotal".
 
+## Repeating tables are matched by content, not position
+
+Rows of a `line_items[]` table are paired with gold rows by similarity, not by
+index. Comparing row *i* against gold row *i* means one reordered or dropped row
+misaligns everything below it, and the damage is not just a low score — comparing
+row 2 against row 1's gold routinely lands on another row's value and trips
+sibling detection, so the reflection model is told it confused two columns when
+it actually read the right cell of the wrong row, and it writes positional
+anchors into a description that was already correct.
+
+Alignment is computed once per table from *all* of its columns jointly, then
+shared by each column's scoring — per-column alignment would let `quantity` and
+`description` choose different row orders, destroying the same-row scoping that
+makes sibling detection mean anything. Every column votes, so a column that is
+broken everywhere still gets its rows matched by the columns that are not.
+Unmatched rows are a count disagreement and stay `length_mismatch`; a dropped
+row now costs one row instead of the whole table.
+
+Order is never scored. No description of `line_items[].quantity` controls the
+order rows come back in, so penalising it feeds the optimiser noise it cannot
+act on. Pass `array_order="positional"` if document order is itself part of your
+contract.
+
 ## Documents
 
 Extraction receives the **native PDF** — Gemini reads it directly, text layer
@@ -360,7 +383,8 @@ may be hours in.
 
 ```
 schema.py      frozen skeleton + candidate binding   <- the safety property
-scoring.py     per-field scoring + sibling detection <- the signal
+scoring.py     per-field scoring, sibling detection,
+               content-based row alignment            <- the signal
 errors.py      error classes + reflection guidance
 reflection.py  asymmetry-aware prompt templates
 selectors.py   coverage guarantee over fields          <- rounds, not calls
