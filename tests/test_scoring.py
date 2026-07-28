@@ -103,6 +103,61 @@ class TestArrayFields:
         assert outcome.fields["line_items[].quantity"].score == pytest.approx(0.5)
         assert outcome.fields["line_items[].description"].score == 1.0
 
+    def test_reordered_rows_score_as_correct(self, schema: ExtractionSchema) -> None:
+        """Row order is not something a field description controls, so an
+        extractor that emits the table bottom-up must not be penalised."""
+        gold = make_gold("001")
+        extracted = {**gold, "line_items": list(reversed(gold["line_items"]))}
+        outcome = score_document(schema, doc_id="001", extracted=extracted, gold=gold)
+        assert outcome.fields["line_items[].quantity"].score == 1.0
+        assert outcome.fields["line_items[].quantity"].error is ErrorClass.CORRECT
+        assert outcome.fields["line_items[].description"].score == 1.0
+
+    def test_reordering_does_not_fabricate_sibling_failures(self, schema: ExtractionSchema) -> None:
+        """The bug positional scoring caused: row 2 compared against row 1's gold
+        lands on another row's value and is misreported as a column confusion."""
+        gold = make_gold("001")
+        extracted = {**gold, "line_items": list(reversed(gold["line_items"]))}
+        outcome = score_document(schema, doc_id="001", extracted=extracted, gold=gold)
+        assert outcome.fields["line_items[].quantity"].related_path is None
+
+    def test_one_wrong_cell_survives_reordering(self, schema: ExtractionSchema) -> None:
+        gold = make_gold("001")
+        rows = list(reversed(gold["line_items"]))
+        rows[0] = {**rows[0], "quantity": 99}  # "Hex bolt, M8" -> wrong quantity
+        outcome = score_document(schema, doc_id="001", extracted={**gold, "line_items": rows}, gold=gold)
+        quantity = outcome.fields["line_items[].quantity"]
+        assert quantity.score == pytest.approx(0.5)
+        assert "item 1:" in quantity.detail  # labelled by gold/document row
+        assert outcome.fields["line_items[].description"].score == 1.0
+
+    def test_dropped_row_costs_only_that_row(self, schema: ExtractionSchema) -> None:
+        """Positionally, dropping the first row misaligns every row below it."""
+        gold = make_gold("001")
+        gold["line_items"] = [
+            {"description": "Steel bracket", "quantity": 4},
+            {"description": "Hex bolt, M8", "quantity": 40},
+            {"description": "Washer, M8", "quantity": 100},
+        ]
+        extracted = {**gold, "line_items": gold["line_items"][1:]}
+        outcome = score_document(schema, doc_id="001", extracted=extracted, gold=gold)
+        quantity = outcome.fields["line_items[].quantity"]
+        assert quantity.score == pytest.approx(2 / 3)
+        assert quantity.error is ErrorClass.LENGTH_MISMATCH
+        assert "extracted 2 items, document contains 3" in quantity.detail
+
+    def test_positional_mode_still_penalises_reordering(self, schema: ExtractionSchema) -> None:
+        gold = make_gold("001")
+        extracted = {**gold, "line_items": list(reversed(gold["line_items"]))}
+        outcome = score_document(schema, doc_id="001", extracted=extracted, gold=gold, array_order="positional")
+        assert outcome.fields["line_items[].quantity"].score == 0.0
+
+    def test_unknown_array_order_is_rejected(self, schema: ExtractionSchema) -> None:
+        with pytest.raises(ValueError, match="array_order"):
+            score_document(
+                schema, doc_id="001", extracted=make_gold("001"), gold=make_gold("001"), array_order="sorted"
+            )
+
     def test_sibling_detection_is_scoped_to_the_same_row(self, schema: ExtractionSchema) -> None:
         """Taking the neighbouring column of the SAME row must be detected as a
         sibling, not written off as an unrelated wrong value."""

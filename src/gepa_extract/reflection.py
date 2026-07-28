@@ -59,8 +59,7 @@ Write a replacement description. It must:
    "...do NOT take the amount immediately above the tax line, which is the subtotal."
 4. State the exact output format when format is at issue, with a worked example.
 5. State what to return when the field is genuinely absent, and how to recognise that case.
-6. Stay under 120 words. A long description dilutes the instruction for a small model.
-7. Carry forward whatever in the current description is already working. The failures below are the
+6. Carry forward whatever in the current description is already working. The failures below are the
    only evidence of what is broken; do not discard the rest.
 
 Do not restate the field's name, type, or whether it is required -- those are fixed by the schema and

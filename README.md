@@ -375,3 +375,152 @@ optimize_descriptions(
 Then check `result.unvisited_fields` — if it contains fields scoring below 1.0,
 the ceiling stopped the run before coverage completed and the guarantee did not
 hold.
+
+## Only descriptions evolve
+
+Keys, types, nesting, required-ness, the task prompt and any organisational
+policy text are **structurally unreachable** by the optimiser. This is enforced
+by construction, not by validation: the candidate GEPA mutates is a flat
+`{field_path: description}` mapping, and the schema is reassembled at
+evaluation time by dropping those descriptions into a skeleton the optimiser
+never sees. There is no code path through which a mutation could alter
+structure. `ExtractionSchema.fingerprint()` exists to prove that in a test.
+
+## The capability asymmetry
+
+The model that *reads* a description is smaller and cheaper than the model that
+*writes* it. The reflection model is a strong VLM that sees the rendered pages
+and can reason about layout; the extraction model typically cannot. So a
+proposal like "identify the correct total" is worthless — it asks the weak
+model to redo reasoning it cannot do.
+
+What transfers is the *result* of that reasoning, written down:
+
+> The grand total appears in the summary block, in the final row **beneath**
+> the tax line. The visually similar amount immediately **above** the tax line
+> is the subtotal — do not take it.
+
+The optimiser is therefore a capability-distillation loop: strong-model
+perception, compiled into text a weak model can follow. The reflection prompts
+in `reflection.py` are written to push for relational anchors ("below the tax
+line") over absolute ones ("lower right"), because relational cues survive a
+change of vendor template and absolute ones do not.
+
+## Error classes
+
+Scoring classifies *how* each field failed, because the fixes diverge:
+
+| Class | Meaning | What the description needs |
+| --- | --- | --- |
+| `sibling_value` | Returned another field's gold value | Positional disambiguation + a negative anchor |
+| `format_mismatch` | Right value, wrong rendering | An explicit format with a worked example |
+| `hallucinated` | Field absent, value invented | Absence conditions, instruction to return null |
+| `missing` | Field present, null returned | Location help, alternative labels |
+| `length_mismatch` | Wrong number of rows | A definition of what counts as one item |
+| `wrong_value` | None of the above | Disambiguation of which entity is meant |
+
+`sibling_value` needs no document coordinates: if the extracted value is
+*exactly some other field's gold value*, that is detectable from the data alone,
+and it is the difference between "wrong" and "took the subtotal".
+
+## Repeating tables are matched by content, not position
+
+Rows of a `line_items[]` table are paired with gold rows by similarity, not by
+index. Comparing row *i* against gold row *i* means one reordered or dropped row
+misaligns everything below it, and the damage is not just a low score — comparing
+row 2 against row 1's gold routinely lands on another row's value and trips
+sibling detection, so the reflection model is told it confused two columns when
+it actually read the right cell of the wrong row, and it writes positional
+anchors into a description that was already correct.
+
+Alignment is computed once per table from *all* of its columns jointly, then
+shared by each column's scoring — per-column alignment would let `quantity` and
+`description` choose different row orders, destroying the same-row scoping that
+makes sibling detection mean anything. Every column votes, so a column that is
+broken everywhere still gets its rows matched by the columns that are not.
+Unmatched rows are a count disagreement and stay `length_mismatch`; a dropped
+row now costs one row instead of the whole table.
+
+Order is never scored. No description of `line_items[].quantity` controls the
+order rows come back in, so penalising it feeds the optimiser noise it cannot
+act on. Pass `array_order="positional"` if document order is itself part of your
+contract.
+
+## Documents
+
+Extraction receives the **native PDF** — Gemini reads it directly, text layer
+intact. Reflection receives **rasterised pages**, because GEPA can carry images
+into a reflection prompt but has no document content part (verified against
+gepa 0.1.4; `Image(path="x.pdf")` does not error, it silently mislabels the PDF
+as `image/png`). So `rendering.py` always passes `media_type` explicitly rather
+than letting it be inferred.
+
+Whole pages are sent, never crops: extraction returns values, not coordinates,
+so there is no region to crop to — and cropping would defeat the purpose of
+letting a strong model do the localisation.
+
+## Install
+
+```bash
+pip install -e '.[gemini,render,dev]'
+export GOOGLE_API_KEY=...
+```
+
+Extras: `gemini` (google-genai), `render` (pypdfium2 + Pillow), `dev` (pytest).
+The core installs with neither, and the whole test suite runs offline against
+`StubExtractor`.
+
+## Examples
+
+| Example | Needs an API key | What it shows |
+| --- | --- | --- |
+| `examples/01_offline_invoices.py` | no | The full loop end to end, including a `total`→subtotal failure being diagnosed and fixed |
+| `examples/02_gemini_invoices.py` | yes | Real Gemini extraction over real PDFs, vision reflection, holdout scoring |
+| `examples/03_custom_backend.py` | no | Adding a provider by implementing `Extractor` |
+| `examples/04_coverage_budget.py` | no | The same run under a metric-call budget vs `rounds_per_field` — identical score, 424 extractions vs 84 |
+| `examples/generate_invoices.py` | no | Builds the PDF corpus used above, in three vendor layouts |
+
+Run them as modules, so the shared schema import resolves:
+
+```bash
+python -m examples.generate_invoices    # writes 12 real PDFs + gold manifest
+python -m examples.01_offline_invoices  # ~1s, no API key
+```
+
+The offline example takes the seed descriptions from 0.800 to 1.000 and changes
+exactly three of ten descriptions — the three it was given evidence about.
+
+## Adding a backend
+
+Implement one method. Nothing about GEPA, scoring, or optimisation crosses this
+boundary:
+
+```python
+class MyExtractor:
+    def extract(self, *, document, schema, task_prompt) -> ExtractionResult:
+        ...
+```
+
+Return `ExtractionResult.failure(...)` rather than raising: one malformed
+response is data about the current candidate, not a reason to abort a run that
+may be hours in.
+
+## Layout
+
+```
+schema.py      frozen skeleton + candidate binding   <- the safety property
+scoring.py     per-field scoring, sibling detection,
+               content-based row alignment            <- the signal
+errors.py      error classes + reflection guidance
+reflection.py  asymmetry-aware prompt templates
+selectors.py   coverage guarantee over fields          <- rounds, not calls
+rendering.py   PDF -> PNG for the reflection model
+extraction.py  the backend interface
+adapter.py     the GEPA seam  ) the only two modules
+optimize.py    the runner     ) that import gepa
+```
+
+That seam is deliberate. If GEPA's pre-1.0 API moves, or a different search
+engine is ever wanted, the domain layer ports unchanged.
+`tests/test_gepa_contracts.py` pins the library behaviours this depends on, so
+an upgrade that breaks them fails loudly instead of silently degrading.
