@@ -12,6 +12,18 @@ redo the reasoning the strong model just did. What transfers is the *result*
 of that reasoning, written down: positional anchors, neighbouring landmarks,
 and explicit negative anchors naming the value to reject.
 
+The second thing these templates fight is **overfitting to the minibatch.**
+Reflection sees a handful of failing documents with concrete doc ids and
+concrete values, and the smallest edit that repairs exactly those documents is
+a rule keyed to their layouts -- which then fails on the valset and on
+everything the run never sampled. So generality is a numbered rule of its own
+rather than a clause attached to the relational-anchor rule, the records are
+named as a *sample*, and the template closes with a transfer test the model can
+actually apply: re-read the proposal against an imagined unseen vendor. Asking
+for the invariant instead of the instances is the shape the descriptions that
+survive the acceptance gate already take; the prompt now asks for it directly
+instead of hoping the acceptance gate filters for it after the fact.
+
 That framing is the substance of these templates. GEPA accepts a
 ``{component_name: template}`` dict (``api.py:158``), so each field type can
 be steered differently while unlisted fields fall back to the default.
@@ -40,9 +52,9 @@ Current description for this field:
 <curr_param>
 
 Below are documents where this field was extracted with the current description, together with the
-gold value, the failure class, and images of the pages. Study the images: your advantage over the
-extraction model is that you can see the layout, and your job is to convert what you see into text
-instructions that do not require sight to follow.
+gold value, the failure class, and images of the pages. They are a SAMPLE of a larger corpus. Study
+the images: your advantage over the extraction model is that you can see the layout, and your job is
+to convert what you see into text instructions that do not require sight to follow.
 
 <side_info>
 """
@@ -52,18 +64,31 @@ Write a replacement description. It must:
 
 1. Be a direct instruction to the extraction model about THIS field only. Never mention other fields
    except as values to reject.
-2. Prefer RELATIONAL anchors over absolute ones. "In the summary block, the row immediately below the
-   tax line" survives a layout change; "in the lower-right corner" does not. Descriptions are scored
-   on documents you have not been shown, including unseen vendor templates.
-3. Name confusable values explicitly and negatively when the failures show one being taken:
+2. State a rule that holds for the whole DOCUMENT FAMILY, not one that repairs the documents below.
+   Those documents are evidence of the failure, not the set you are being scored on -- the
+   description is applied to documents you have not seen, in vendor templates you have not seen.
+   Write the invariant you inferred, never the instances you inferred it from. "The row labelled
+   Total, Amount Due, or Balance Due" transfers; "the 1,320.00 beside TOTAL DUE" does not. A rule
+   naming a particular vendor, amount, date, page number, or fixed position on the page is
+   overfitted, and it will score worse than the description you were given.
+3. Prefer RELATIONAL anchors over absolute ones -- this is how a rule earns its generality. "In the
+   summary block, the row immediately below the tax line" survives a layout change; "in the
+   lower-right corner" does not.
+4. Name confusable values explicitly and negatively when the failures show one being taken:
    "...do NOT take the amount immediately above the tax line, which is the subtotal."
-4. State the exact output format when format is at issue, with a worked example.
-5. State what to return when the field is genuinely absent, and how to recognise that case.
-6. Carry forward whatever in the current description is already working. The failures below are the
+5. State the exact output format when format is at issue, with a worked example.
+6. State what to return when the field is genuinely absent, and how to recognise that case.
+7. Carry forward whatever in the current description is already working. The failures below are the
    only evidence of what is broken; do not discard the rest.
 
 Do not restate the field's name, type, or whether it is required -- those are fixed by the schema and
 are already supplied to the extraction model.
+
+Before you answer, apply this test. Take your description and imagine a document from a vendor not
+shown below, laying the same information out differently -- different labels, different column order,
+the summary block on the left. Would your description still select the right value? If it only works
+on the documents above, it is not finished: replace whatever is specific to them with the general
+property that made it correct.
 
 Return ONLY the new description, inside a fenced code block:
 

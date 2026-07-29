@@ -162,6 +162,15 @@ class TestContract3PerFieldReflectionTemplates:
     def test_array_fields_are_steered_toward_same_row_confusables(self, schema) -> None:
         assert "OTHER COLUMNS OF THE SAME ROW" in build_templates(schema)["line_items[].quantity"]
 
+    def test_every_template_asks_for_a_rule_that_generalises(self, schema) -> None:
+        """Reflection sees only the failing minibatch, so the pull towards a fix
+        keyed to those documents is constant. Every field must carry the
+        counter-pressure, not just the ones with type-specific notes."""
+        for name, template in build_templates(schema).items():
+            assert "DOCUMENT FAMILY" in template, name
+            assert "SAMPLE of a larger corpus" in template, name
+            assert "a vendor not\nshown below" in template, name
+
 
 class TestContract5CoverageGuaranteeFoundations:
     """The four gepa behaviours ``rounds_per_field`` is built on.
